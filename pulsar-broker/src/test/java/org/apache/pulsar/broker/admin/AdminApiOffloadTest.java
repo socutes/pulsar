@@ -1,3 +1,4 @@
+
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -27,6 +28,8 @@ import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertTrue;
+
 import com.google.common.collect.Sets;
 import java.util.HashMap;
 import java.util.Map;
@@ -45,12 +48,16 @@ import org.apache.pulsar.common.naming.NamespaceName;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.ClusterData;
 import org.apache.pulsar.common.policies.data.OffloadPolicies;
-import org.apache.pulsar.common.policies.data.TenantInfo;
+import org.apache.pulsar.common.policies.data.OffloadPoliciesImpl;
+import org.apache.pulsar.common.policies.data.OffloadedReadPriority;
+import org.apache.pulsar.common.policies.data.TenantInfoImpl;
+import org.awaitility.Awaitility;
 import org.testng.Assert;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
+@Test(groups = "broker")
 public class AdminApiOffloadTest extends MockedPulsarServiceBaseTest {
 
     private final String testTenant = "prop-xyz";
@@ -69,8 +76,8 @@ public class AdminApiOffloadTest extends MockedPulsarServiceBaseTest {
         super.internalSetup();
 
         // Setup namespaces
-        admin.clusters().createCluster("test", new ClusterData(pulsar.getWebServiceAddress()));
-        TenantInfo tenantInfo = new TenantInfo(Sets.newHashSet("role1", "role2"), Sets.newHashSet("test"));
+        admin.clusters().createCluster("test", ClusterData.builder().serviceUrl(pulsar.getWebServiceAddress()).build());
+        TenantInfoImpl tenantInfo = new TenantInfoImpl(Sets.newHashSet("role1", "role2"), Sets.newHashSet("test"));
         admin.tenants().createTenant(testTenant, tenantInfo);
         admin.namespaces().createNamespace(myNamespace, Sets.newHashSet("test"));
     }
@@ -100,12 +107,12 @@ public class AdminApiOffloadTest extends MockedPulsarServiceBaseTest {
         ManagedLedgerInfo info = pulsar.getManagedLedgerFactory().getManagedLedgerInfo(mlName);
         assertEquals(info.ledgers.size(), 2);
 
-        assertEquals(admin.topics().offloadStatus(topicName).status,
+        assertEquals(admin.topics().offloadStatus(topicName).getStatus(),
                             LongRunningProcessStatus.Status.NOT_RUN);
 
         admin.topics().triggerOffload(topicName, currentId);
 
-        assertEquals(admin.topics().offloadStatus(topicName).status,
+        assertEquals(admin.topics().offloadStatus(topicName).getStatus(),
                             LongRunningProcessStatus.Status.RUNNING);
 
         try {
@@ -118,9 +125,9 @@ public class AdminApiOffloadTest extends MockedPulsarServiceBaseTest {
         // fail first time
         promise.completeExceptionally(new Exception("Some random failure"));
 
-        assertEquals(admin.topics().offloadStatus(topicName).status,
+        assertEquals(admin.topics().offloadStatus(topicName).getStatus(),
                             LongRunningProcessStatus.Status.ERROR);
-        Assert.assertTrue(admin.topics().offloadStatus(topicName).lastError.contains("Some random failure"));
+        Assert.assertTrue(admin.topics().offloadStatus(topicName).getLastError().contains("Some random failure"));
 
         // Try again
         doReturn(CompletableFuture.completedFuture(null))
@@ -128,12 +135,15 @@ public class AdminApiOffloadTest extends MockedPulsarServiceBaseTest {
 
         admin.topics().triggerOffload(topicName, currentId);
 
-        assertEquals(admin.topics().offloadStatus(topicName).status,
-                            LongRunningProcessStatus.Status.SUCCESS);
-        MessageIdImpl firstUnoffloaded = admin.topics().offloadStatus(topicName).firstUnoffloadedMessage;
+        Awaitility.await().untilAsserted(() ->
+                assertEquals(admin.topics().offloadStatus(topicName).getStatus(),
+                LongRunningProcessStatus.Status.SUCCESS));
+        MessageId firstUnoffloaded = admin.topics().offloadStatus(topicName).getFirstUnoffloadedMessage();
+        assertTrue(firstUnoffloaded instanceof MessageIdImpl);
+        MessageIdImpl firstUnoffloadedMessage = (MessageIdImpl) firstUnoffloaded;
         // First unoffloaded is the first entry of current ledger
-        assertEquals(firstUnoffloaded.getLedgerId(), info.ledgers.get(1).ledgerId);
-        assertEquals(firstUnoffloaded.getEntryId(), 0);
+        assertEquals(firstUnoffloadedMessage.getLedgerId(), info.ledgers.get(1).ledgerId);
+        assertEquals(firstUnoffloadedMessage.getEntryId(), 0);
 
         verify(offloader, times(2)).offload(any(), any(), any());
     }
@@ -162,10 +172,10 @@ public class AdminApiOffloadTest extends MockedPulsarServiceBaseTest {
         String endpoint = "test-endpoint";
         long offloadThresholdInBytes = 0;
         long offloadDeletionLagInMillis = 100L;
-        OffloadPolicies.OffloadedReadPriority priority = OffloadPolicies.OffloadedReadPriority.TIERED_STORAGE_FIRST;
+        OffloadedReadPriority priority = OffloadedReadPriority.TIERED_STORAGE_FIRST;
 
-        OffloadPolicies offload1 = OffloadPolicies.create(
-                driver, region, bucket, endpoint, null, null,
+        OffloadPolicies offload1 = OffloadPoliciesImpl.create(
+                driver, region, bucket, endpoint, null, null, null, null,
                 100, 100, offloadThresholdInBytes, offloadDeletionLagInMillis, priority);
         admin.namespaces().setOffloadPolicies(namespaceName, offload1);
         OffloadPolicies offload2 = admin.namespaces().getOffloadPolicies(namespaceName);
@@ -180,47 +190,79 @@ public class AdminApiOffloadTest extends MockedPulsarServiceBaseTest {
     public void testOffloadPoliciesApi() throws Exception {
         final String topicName = testTopic + UUID.randomUUID().toString();
         admin.topics().createPartitionedTopic(topicName, 3);
-        //wait for server init
-        Thread.sleep(1000);
-        OffloadPolicies offloadPolicies = admin.topics().getOffloadPolicies(topicName);
+        pulsarClient.newProducer().topic(topicName).create().close();
+        OffloadPoliciesImpl offloadPolicies = (OffloadPoliciesImpl) admin.topics().getOffloadPolicies(topicName);
         assertNull(offloadPolicies);
-        OffloadPolicies offload = new OffloadPolicies();
+        OffloadPoliciesImpl offload = new OffloadPoliciesImpl();
         String path = "fileSystemPath";
         offload.setFileSystemProfilePath(path);
         admin.topics().setOffloadPolicies(topicName, offload);
-        for (int i = 0; i < 50; i++) {
-            if (admin.topics().getOffloadPolicies(topicName) != null) {
-                break;
-            }
-            Thread.sleep(100);
-        }
+        Awaitility.await().untilAsserted(()
+                -> assertNotNull(admin.topics().getOffloadPolicies(topicName)));
         assertEquals(admin.topics().getOffloadPolicies(topicName), offload);
         assertEquals(admin.topics().getOffloadPolicies(topicName).getFileSystemProfilePath(), path);
         admin.topics().removeOffloadPolicies(topicName);
-        for (int i = 0; i < 50; i++) {
-            if (admin.topics().getOffloadPolicies(topicName) == null) {
-                break;
-            }
-            Thread.sleep(100);
-        }
+        Awaitility.await().untilAsserted(()
+                -> assertNull(admin.topics().getOffloadPolicies(topicName)));
         assertNull(admin.topics().getOffloadPolicies(topicName));
     }
 
     @Test
+    public void testOffloadPoliciesAppliedApi() throws Exception {
+        final String topicName = testTopic + UUID.randomUUID().toString();
+        admin.topics().createPartitionedTopic(topicName, 3);
+        pulsarClient.newProducer().topic(topicName).create().close();
+        OffloadPoliciesImpl offloadPolicies = (OffloadPoliciesImpl) admin.topics().getOffloadPolicies(topicName, true);
+        OffloadPoliciesImpl brokerPolicies = OffloadPoliciesImpl
+                .mergeConfiguration(null,null, pulsar.getConfiguration().getProperties());
+
+        assertEquals(offloadPolicies, brokerPolicies);
+        //Since off loader is not really set, avoid code exceptions
+        LedgerOffloader topicOffloaded = mock(LedgerOffloader.class);
+        when(topicOffloaded.getOffloadDriverName()).thenReturn("mock");
+        doReturn(topicOffloaded).when(pulsar).createManagedLedgerOffloader(any());
+
+        OffloadPoliciesImpl namespacePolicies = new OffloadPoliciesImpl();
+        namespacePolicies.setManagedLedgerOffloadThresholdInBytes(100L);
+        namespacePolicies.setManagedLedgerOffloadDeletionLagInMillis(200L);
+        namespacePolicies.setManagedLedgerOffloadDriver("s3");
+        namespacePolicies.setManagedLedgerOffloadBucket("buck");
+        admin.namespaces().setOffloadPolicies(myNamespace, namespacePolicies);
+        Awaitility.await().untilAsserted(() ->
+                assertEquals(admin.namespaces().getOffloadPolicies(myNamespace), namespacePolicies));
+        assertEquals(
+                admin.topics().getOffloadPolicies(topicName, true), namespacePolicies);
+
+        OffloadPoliciesImpl topicPolicies = new OffloadPoliciesImpl();
+        topicPolicies.setManagedLedgerOffloadThresholdInBytes(200L);
+        topicPolicies.setManagedLedgerOffloadDeletionLagInMillis(400L);
+        topicPolicies.setManagedLedgerOffloadDriver("s3");
+        topicPolicies.setManagedLedgerOffloadBucket("buck2");
+
+        admin.topics().setOffloadPolicies(topicName, topicPolicies);
+        Awaitility.await().untilAsserted(()
+                -> assertEquals(admin.topics().getOffloadPolicies(topicName, true), topicPolicies));
+
+        admin.topics().removeOffloadPolicies(topicName);
+        Awaitility.await().untilAsserted(()
+                -> assertEquals(admin.topics().getOffloadPolicies(topicName, true), namespacePolicies));
+
+        admin.namespaces().removeOffloadPolicies(myNamespace);
+        Awaitility.await().untilAsserted(()
+                -> assertEquals(admin.topics().getOffloadPolicies(topicName, true), brokerPolicies));
+    }
+
+    @Test
     public void testTopicLevelOffloadPartitioned() throws Exception {
-        //wait for cache init
-        Thread.sleep(2000);
         testOffload(true);
     }
 
     @Test
     public void testTopicLevelOffloadNonPartitioned() throws Exception {
-        //wait for cache init
-        Thread.sleep(2000);
         testOffload(false);
     }
 
-    public void testOffload(boolean isPartitioned) throws Exception {
+    private void testOffload(boolean isPartitioned) throws Exception {
         String topicName = testTopic + UUID.randomUUID().toString();
         int partitionNum = 3;
         //1 create topic
@@ -247,7 +289,7 @@ public class AdminApiOffloadTest extends MockedPulsarServiceBaseTest {
                     , "NullLedgerOffloader");
         }
         //3 construct a topic level offloadPolicies
-        OffloadPolicies offloadPolicies = new OffloadPolicies();
+        OffloadPoliciesImpl offloadPolicies = new OffloadPoliciesImpl();
         offloadPolicies.setOffloadersDirectory(".");
         offloadPolicies.setManagedLedgerOffloadDriver("mock");
         offloadPolicies.setManagedLedgerOffloadPrefetchRounds(10);
@@ -259,12 +301,8 @@ public class AdminApiOffloadTest extends MockedPulsarServiceBaseTest {
 
         //4 set topic level offload policies
         admin.topics().setOffloadPolicies(topicName, offloadPolicies);
-        for (int i = 0; i < 50; i++) {
-            if (admin.topics().getOffloadPolicies(topicName) != null) {
-                break;
-            }
-            Thread.sleep(500);
-        }
+        Awaitility.await().untilAsserted(()
+                -> assertNotNull(admin.topics().getOffloadPolicies(topicName)));
         //5 name of offload should become "mock"
         if (isPartitioned) {
             for (int i = 0; i < partitionNum; i++) {
@@ -287,14 +325,12 @@ public class AdminApiOffloadTest extends MockedPulsarServiceBaseTest {
         Map<NamespaceName, LedgerOffloader> map = new HashMap<>();
         map.put(TopicName.get(topicName).getNamespaceObject(), namespaceOffloader);
         doReturn(map).when(pulsar).getLedgerOffloaderMap();
+        doReturn(namespaceOffloader).when(pulsar)
+                .getManagedLedgerOffloader(TopicName.get(topicName).getNamespaceObject(), null);
 
         admin.topics().removeOffloadPolicies(topicName);
-        for (int i = 0; i < 50; i++) {
-            if (admin.topics().getOffloadPolicies(topicName) == null) {
-                break;
-            }
-            Thread.sleep(500);
-        }
+        Awaitility.await().untilAsserted(()
+                -> assertNull(admin.topics().getOffloadPolicies(topicName)));
         // topic level offloader should be closed
         if (isPartitioned) {
             verify(topicOffloader, times(partitionNum)).close();

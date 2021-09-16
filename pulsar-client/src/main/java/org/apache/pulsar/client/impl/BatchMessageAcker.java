@@ -18,7 +18,6 @@
  */
 package org.apache.pulsar.client.impl;
 
-import com.google.common.annotations.VisibleForTesting;
 import java.util.BitSet;
 
 class BatchMessageAcker {
@@ -42,14 +41,13 @@ class BatchMessageAcker {
     // bitset shared across messages in the same batch.
     private final int batchSize;
     private final BitSet bitSet;
-    private boolean prevBatchCumulativelyAcked = false;
+    private volatile boolean prevBatchCumulativelyAcked = false;
 
     BatchMessageAcker(BitSet bitSet, int batchSize) {
         this.bitSet = bitSet;
         this.batchSize = batchSize;
     }
 
-    @VisibleForTesting
     BitSet getBitSet() {
         return bitSet;
     }

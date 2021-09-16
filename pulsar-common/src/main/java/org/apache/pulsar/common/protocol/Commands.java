@@ -28,12 +28,12 @@ import io.netty.buffer.Unpooled;
 import io.netty.util.concurrent.FastThreadLocal;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
 import lombok.experimental.UtilityClass;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
@@ -63,6 +63,7 @@ import org.apache.pulsar.common.api.proto.CommandConnected;
 import org.apache.pulsar.common.api.proto.CommandEndTxnOnPartitionResponse;
 import org.apache.pulsar.common.api.proto.CommandEndTxnOnSubscriptionResponse;
 import org.apache.pulsar.common.api.proto.CommandEndTxnResponse;
+import org.apache.pulsar.common.api.proto.CommandGetLastMessageIdResponse;
 import org.apache.pulsar.common.api.proto.CommandGetSchema;
 import org.apache.pulsar.common.api.proto.CommandGetSchemaResponse;
 import org.apache.pulsar.common.api.proto.CommandGetTopicsOfNamespace;
@@ -417,6 +418,9 @@ public class Commands {
     }
 
     public static void parseMessageMetadata(ByteBuf buffer, MessageMetadata msgMetadata) {
+        // initially reader-index may point to start of broker entry metadata :
+        // increment reader-index to start_of_headAndPayload to parse metadata
+        skipBrokerEntryMetadataIfExist(buffer);
         // initially reader-index may point to start_of_checksum : increment reader-index to start_of_metadata
         // to parse metadata
         skipChecksumIfPresent(buffer);
@@ -693,9 +697,11 @@ public class Commands {
                 .setType(getSchemaType(schemaInfo.getType()));
 
         schemaInfo.getProperties().entrySet().stream().forEach(entry -> {
-            schema.addProperty()
-                .setKey(entry.getKey())
-                .setValue(entry.getValue());
+            if (entry.getKey() != null && entry.getValue() != null) {
+                schema.addProperty()
+                        .setKey(entry.getKey())
+                        .setValue(entry.getValue());
+            }
         });
     }
 
@@ -858,18 +864,22 @@ public class Commands {
     }
 
     public static ByteBuf newMultiMessageAck(long consumerId,
-            List<Triple<Long, Long, ConcurrentBitSetRecyclable>> entries) {
+                                             List<Triple<Long, Long, ConcurrentBitSetRecyclable>> entries,
+                                             long requestId) {
         BaseCommand cmd = newMultiMessageAckCommon(entries);
         cmd.getAck()
                 .setConsumerId(consumerId)
                 .setAckType(AckType.Individual);
+            if (requestId >= 0) {
+                cmd.getAck().setRequestId(requestId);
+            }
         return serializeWithSize(cmd);
     }
 
     public static ByteBuf newAck(long consumerId, long ledgerId, long entryId, BitSetRecyclable ackSet, AckType ackType,
-                                 ValidationError validationError, Map<String, Long> properties) {
+                                 ValidationError validationError, Map<String, Long> properties, long requestId) {
         return newAck(consumerId, ledgerId, entryId, ackSet, ackType, validationError,
-                properties, -1L, -1L, -1L, -1);
+                properties, -1L, -1L, requestId, -1);
     }
 
     public static ByteBuf newAck(long consumerId, long ledgerId, long entryId, BitSetRecyclable ackSet, AckType ackType,
@@ -1008,7 +1018,7 @@ public class Commands {
         return serializeWithSize(newGetTopicsOfNamespaceResponseCommand(topics, requestId));
     }
 
-    private final static ByteBuf cmdPing;
+    private static final ByteBuf cmdPing;
 
     static {
         BaseCommand cmd = new BaseCommand()
@@ -1023,7 +1033,7 @@ public class Commands {
         return cmdPing.retainedDuplicate();
     }
 
-    private final static ByteBuf cmdPong;
+    private static final ByteBuf cmdPong;
 
     static {
         BaseCommand cmd = new BaseCommand()
@@ -1034,7 +1044,7 @@ public class Commands {
         serializedCmdPong.release();
     }
 
-    static ByteBuf newPong() {
+    public static ByteBuf newPong() {
         return cmdPong.retainedDuplicate();
     }
 
@@ -1046,16 +1056,25 @@ public class Commands {
         return serializeWithSize(cmd);
     }
 
-    public static ByteBuf newGetLastMessageIdResponse(long requestId, long ledgerId, long entryId,
-            int partitionIdx, int batchIndex) {
+    public static ByteBuf newGetLastMessageIdResponse(long requestId,
+            long lastMessageLedgerId, long lastMessageEntryId,
+            int lastMessagePartitionIdx, int lastMessageBatchIndex,
+            long markDeletePositionLedgerId, long markDeletePositionEntryId) {
         BaseCommand cmd = localCmd(Type.GET_LAST_MESSAGE_ID_RESPONSE);
-        cmd.setGetLastMessageIdResponse()
-            .setRequestId(requestId)
-            .setLastMessageId()
-            .setLedgerId(ledgerId)
-            .setEntryId(entryId)
-            .setPartition(partitionIdx)
-            .setBatchIndex(batchIndex);
+        CommandGetLastMessageIdResponse response = cmd.setGetLastMessageIdResponse()
+            .setRequestId(requestId);
+
+        response.setLastMessageId()
+            .setLedgerId(lastMessageLedgerId)
+            .setEntryId(lastMessageEntryId)
+            .setPartition(lastMessagePartitionIdx)
+            .setBatchIndex(lastMessageBatchIndex);
+
+        if (markDeletePositionLedgerId >= 0) {
+            response.setConsumerMarkDeletePosition()
+                    .setLedgerId(markDeletePositionLedgerId)
+                    .setEntryId(markDeletePositionEntryId);
+        }
         return serializeWithSize(cmd);
     }
 
@@ -1274,7 +1293,7 @@ public class Commands {
     }
 
     public static ByteBuf newEndTxnOnPartition(long requestId, long txnIdLeastBits, long txnIdMostBits, String topic,
-                                               TxnAction txnAction, List<MessageIdData> messageIdDataList) {
+                                               TxnAction txnAction, long lowWaterMark) {
         BaseCommand cmd = localCmd(Type.END_TXN_ON_PARTITION);
         cmd.setEndTxnOnPartition()
                 .setRequestId(requestId)
@@ -1282,7 +1301,7 @@ public class Commands {
                 .setTxnidMostBits(txnIdMostBits)
                 .setTopic(topic)
                 .setTxnAction(txnAction)
-                .addAllMessageIds(messageIdDataList);
+                .setTxnidLeastBitsOfLowWatermark(lowWaterMark);
         return serializeWithSize(cmd);
     }
 
@@ -1295,10 +1314,13 @@ public class Commands {
         return serializeWithSize(cmd);
     }
 
-    public static ByteBuf newEndTxnOnPartitionResponse(long requestId, ServerError error, String errorMsg) {
+    public static ByteBuf newEndTxnOnPartitionResponse(long requestId, ServerError error, String errorMsg,
+                                                       long txnIdLeastBits, long txnIdMostBits) {
         BaseCommand cmd = localCmd(Type.END_TXN_ON_PARTITION_RESPONSE);
         CommandEndTxnOnPartitionResponse response = cmd.setEndTxnOnPartitionResponse()
                 .setRequestId(requestId)
+                .setTxnidMostBits(txnIdMostBits)
+                .setTxnidLeastBits(txnIdLeastBits)
                 .setError(error);
         if (errorMsg != null) {
             response.setMessage(errorMsg);
@@ -1307,13 +1329,14 @@ public class Commands {
     }
 
     public static ByteBuf newEndTxnOnSubscription(long requestId, long txnIdLeastBits, long txnIdMostBits, String topic,
-            String subscription, TxnAction txnAction) {
+            String subscription, TxnAction txnAction, long lowWaterMark) {
         BaseCommand cmd = localCmd(Type.END_TXN_ON_SUBSCRIPTION);
         cmd.setEndTxnOnSubscription()
                 .setRequestId(requestId)
                 .setTxnidLeastBits(txnIdLeastBits)
                 .setTxnidMostBits(txnIdMostBits)
                 .setTxnAction(txnAction)
+                .setTxnidLeastBitsOfLowWatermark(lowWaterMark)
                 .setSubscription()
                 .setTopic(topic)
                 .setSubscription(subscription);
@@ -1660,6 +1683,23 @@ public class Commands {
         }
     }
 
+    private static final byte[] NONE_KEY = "NONE_KEY".getBytes(StandardCharsets.UTF_8);
+    public static byte[] peekStickyKey(ByteBuf metadataAndPayload, String topic, String subscription) {
+        try {
+            int readerIdx = metadataAndPayload.readerIndex();
+            MessageMetadata metadata = Commands.parseMessageMetadata(metadataAndPayload);
+            metadataAndPayload.readerIndex(readerIdx);
+            if (metadata.hasOrderingKey()) {
+                return metadata.getOrderingKey();
+            } else if (metadata.hasPartitionKey()) {
+                return metadata.getPartitionKey().getBytes(StandardCharsets.UTF_8);
+            }
+        } catch (Throwable t) {
+            log.error("[{}] [{}] Failed to peek sticky key from the message metadata", topic, subscription, t);
+        }
+        return Commands.NONE_KEY;
+    }
+
     public static int getCurrentProtocolVersion() {
         // Return the last ProtocolVersion enum value
         return ProtocolVersion.values()[ProtocolVersion.values().length - 1].getValue();
@@ -1691,6 +1731,10 @@ public class Commands {
 
     public static boolean peerSupportsGetOrCreateSchema(int peerVersion) {
         return peerVersion >= ProtocolVersion.v15.getValue();
+    }
+
+    public static boolean peerSupportsAckReceipt(int peerVersion) {
+        return peerVersion >= ProtocolVersion.v17.getValue();
     }
 
     private static org.apache.pulsar.common.api.proto.ProducerAccessMode convertProducerAccessMode(ProducerAccessMode accessMode) {

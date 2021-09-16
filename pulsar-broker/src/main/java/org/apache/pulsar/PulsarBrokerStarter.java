@@ -26,9 +26,11 @@ import static org.apache.pulsar.common.configuration.PulsarConfigurationLoader.c
 import static org.apache.pulsar.common.configuration.PulsarConfigurationLoader.isComplete;
 import com.beust.jcommander.JCommander;
 import com.beust.jcommander.Parameter;
+import com.beust.jcommander.Parameters;
 import com.google.common.annotations.VisibleForTesting;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.InputStream;
 import java.net.MalformedURLException;
 import java.nio.file.Paths;
 import java.text.DateFormat;
@@ -43,12 +45,15 @@ import org.apache.bookkeeper.replication.AutoRecoveryMain;
 import org.apache.bookkeeper.stats.StatsProvider;
 import org.apache.bookkeeper.util.DirectMemoryUtils;
 import org.apache.commons.configuration.ConfigurationException;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.util.datetime.FixedDateFormat;
 import org.apache.pulsar.broker.PulsarServerException;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.common.allocator.PulsarByteBufAllocator;
 import org.apache.pulsar.common.naming.NamespaceBundleSplitAlgorithm;
 import org.apache.pulsar.common.protocol.Commands;
+import org.apache.pulsar.common.util.CmdGenerateDocs;
 import org.apache.pulsar.functions.worker.WorkerConfig;
 import org.apache.pulsar.functions.worker.WorkerService;
 import org.apache.pulsar.functions.worker.service.WorkerServiceLoader;
@@ -61,13 +66,16 @@ public class PulsarBrokerStarter {
     private static ServiceConfiguration loadConfig(String configFile) throws Exception {
         SLF4JBridgeHandler.removeHandlersForRootLogger();
         SLF4JBridgeHandler.install();
-        ServiceConfiguration config = create((new FileInputStream(configFile)), ServiceConfiguration.class);
-        // it validates provided configuration is completed
-        isComplete(config);
-        return config;
+        try (InputStream inputStream = new FileInputStream(configFile)) {
+            ServiceConfiguration config = create(inputStream, ServiceConfiguration.class);
+            // it validates provided configuration is completed
+            isComplete(config);
+            return config;
+        }
     }
 
     @VisibleForTesting
+    @Parameters(commandDescription = "Options")
     private static class StarterArguments {
         @Parameter(names = {"-c", "--broker-conf"}, description = "Configuration file for Broker")
         private String brokerConfigFile =
@@ -93,6 +101,9 @@ public class PulsarBrokerStarter {
 
         @Parameter(names = {"-h", "--help"}, description = "Show this help message")
         private boolean help = false;
+
+        @Parameter(names = {"-g", "--generate-docs"}, description = "Generate docs")
+        private boolean generateDocs = false;
     }
 
     private static ServerConfiguration readBookieConfFile(String bookieConfigFile) throws IllegalArgumentException {
@@ -130,7 +141,7 @@ public class PulsarBrokerStarter {
         private final WorkerService functionsWorkerService;
         private final WorkerConfig workerConfig;
 
-        BrokerStarter(String[] args) throws Exception{
+        BrokerStarter(String[] args) throws Exception {
             StarterArguments starterArguments = new StarterArguments();
             JCommander jcommander = new JCommander(starterArguments);
             jcommander.setProgramName("PulsarBrokerStarter");
@@ -139,6 +150,13 @@ public class PulsarBrokerStarter {
             jcommander.parse(args);
             if (starterArguments.help) {
                 jcommander.usage();
+                System.exit(-1);
+            }
+
+            if (starterArguments.generateDocs) {
+                CmdGenerateDocs cmd = new CmdGenerateDocs("pulsar");
+                cmd.addCommand("broker", starterArguments);
+                cmd.run(null);
                 System.exit(-1);
             }
 
@@ -299,11 +317,13 @@ public class PulsarBrokerStarter {
 
 
     public static void main(String[] args) throws Exception {
-        DateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd hh:mm:ss,SSS");
+        DateFormat dateFormat = new SimpleDateFormat(
+            FixedDateFormat.FixedFormat.ISO8601_OFFSET_DATE_TIME_HHMM.getPattern());
         Thread.setDefaultUncaughtExceptionHandler((thread, exception) -> {
             System.out.println(String.format("%s [%s] error Uncaught exception in thread %s: %s",
                     dateFormat.format(new Date()), thread.getContextClassLoader(),
                     thread.getName(), exception.getMessage()));
+            exception.printStackTrace(System.out);
         });
 
         BrokerStarter starter = new BrokerStarter(args);
@@ -326,6 +346,7 @@ public class PulsarBrokerStarter {
             starter.start();
         } catch (Throwable t) {
             log.error("Failed to start pulsar service.", t);
+            LogManager.shutdown();
             Runtime.getRuntime().halt(1);
         } finally {
             starter.join();

@@ -26,9 +26,9 @@ import javax.servlet.ServletException;
 import javax.servlet.ServletRequest;
 import javax.servlet.ServletResponse;
 import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 import javax.ws.rs.core.MediaType;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.pulsar.broker.intercept.BrokerInterceptor;
 import org.apache.pulsar.common.intercept.InterceptException;
 
@@ -37,8 +37,11 @@ public class PreInterceptFilter implements Filter {
 
     private final BrokerInterceptor interceptor;
 
-    public PreInterceptFilter(BrokerInterceptor interceptor) {
+    private final ExceptionHandler exceptionHandler;
+
+    public PreInterceptFilter(BrokerInterceptor interceptor, ExceptionHandler exceptionHandler) {
         this.interceptor = interceptor;
+        this.exceptionHandler = exceptionHandler;
     }
 
     @Override
@@ -54,7 +57,9 @@ public class PreInterceptFilter implements Filter {
                     servletRequest.getServletContext().getContextPath(),
                     servletRequest.getContentType());
         }
-        if (MediaType.MULTIPART_FORM_DATA.equalsIgnoreCase(servletRequest.getContentType())) {
+        if (StringUtils.containsIgnoreCase(servletRequest.getContentType(), MediaType.MULTIPART_FORM_DATA)
+                || StringUtils.containsIgnoreCase(servletRequest.getContentType(),
+                MediaType.APPLICATION_OCTET_STREAM)) {
             // skip multipart request at this moment
             filterChain.doFilter(servletRequest, servletResponse);
             return;
@@ -64,7 +69,7 @@ public class PreInterceptFilter implements Filter {
             interceptor.onWebserviceRequest(requestWrapper);
             filterChain.doFilter(requestWrapper, servletResponse);
         } catch (InterceptException e) {
-            ((HttpServletResponse) servletResponse).sendError(e.getErrorCode(), e.getMessage());
+            exceptionHandler.handle(servletResponse, e);
         }
     }
 
